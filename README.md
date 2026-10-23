@@ -13,13 +13,18 @@ then the clock view takes over until it fires.
 
 ## Install
 
+The repo is the install. There is no separate copy to keep in sync: clone it
+where it should live, then symlink it into `PATH`.
+
 ```sh
-install -m 755 nl-timer ~/.local/bin/nl-timer
-ln -sf ~/.local/bin/nl-timer ~/.local/bin/timer
-ln -sf ~/.local/bin/nl-timer ~/.local/bin/tmr
+git clone https://github.com/venus-fire/nl-timer.git ~/.local/share/nl-timer
+ln -sf ../share/nl-timer/nl-timer ~/.local/bin/nl-timer
+ln -sf ../share/nl-timer/nl-timer ~/.local/bin/timer
+ln -sf ../share/nl-timer/nl-timer ~/.local/bin/tmr
 ```
 
-`~/.local/bin` needs to be on your `PATH`. Requires Python 3.11 or newer, a
+Updating is `git -C ~/.local/share/nl-timer pull`, and editing the file in the
+repo edits the installed tool. `~/.local/bin` needs to be on your `PATH`. Requires Python 3.11 or newer, a
 notification server that speaks `org.freedesktop.Notifications`, and one of
 `paplay`, `pw-play`, `canberra-gtk-play` or `ffplay` for sound.
 
