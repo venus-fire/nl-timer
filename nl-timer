@@ -1,0 +1,1360 @@
+#!/usr/bin/env python3
+"""nl-timer - natural language timers with a big block clock in the terminal.
+
+    timer 10m                      ten minutes from now, big clock
+    timer set 12:15                until 12:15, next occurrence
+    timer until 5pm
+    timer half past five
+    timer list / cancel 3f2a / clear
+    timer watch 3f2a               attach the big clock to a running timer
+    timer config                   show and change settings
+    timer sounds                   available alarm sounds
+
+Timers run as detached processes, so they survive the terminal closing. The
+big clock is only a viewer: quitting it does not stop the timer. A firing
+raises one persistent notification, and dismissing it silences the alarm.
+Stdlib only.
+"""
+
+import json
+import os
+import re
+import select
+import shutil
+import signal
+import subprocess
+import sys
+import termios
+import time
+import tty
+import uuid
+from datetime import datetime, timedelta
+from pathlib import Path
+
+VERSION = "2.0.0"
+APP = "Timer"
+
+STATE_DIR = Path(os.environ.get("NL_TIMER_STATE") or (Path.home() / ".local/state/nl-timer"))
+TIMERS_DIR = STATE_DIR / "timers"
+FIRED_LOG = STATE_DIR / "fired.log"
+CONFIG_PATH = Path(
+    os.environ.get("NL_TIMER_CONFIG")
+    or (Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
+        / "nl-timer" / "config.toml")
+)
+SOUND_DIRS = [
+    Path("/usr/share/sounds/freedesktop/stereo"),
+    Path("/usr/share/sounds"),
+]
+
+DEFAULTS = {
+    "sound": "alarm-clock-elapsed",
+    "sound_repeats": 3,
+    "volume": 100,
+    "notify": True,
+    "bigclock": "auto",
+}
+
+MAX_SECONDS = 30 * 24 * 3600
+CLOCK_WARN_SECONDS = 12 * 3600
+
+
+class ParseError(Exception):
+    pass
+
+
+# ---------------------------------------------------------------- config
+
+def load_config() -> dict:
+    cfg = dict(DEFAULTS)
+    if not CONFIG_PATH.is_file():
+        return cfg
+    try:
+        import tomllib
+        with CONFIG_PATH.open("rb") as fh:
+            data = tomllib.load(fh)
+    except Exception as exc:  # a broken config must not break a timer
+        sys.stderr.write(f"timer: ignoring {CONFIG_PATH}: {exc}\n")
+        return cfg
+    for key, value in data.items():
+        if key not in DEFAULTS:
+            continue
+        if isinstance(value, type(DEFAULTS[key])) and not (
+                isinstance(DEFAULTS[key], bool) and not isinstance(value, bool)):
+            cfg[key] = value
+        else:
+            sys.stderr.write(f"timer: ignoring {key} in config, wrong type\n")
+    return cfg
+
+
+def save_config(cfg: dict) -> None:
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    lines = [
+        "# nl-timer settings",
+        "# sound: a name from `timer sounds`, an absolute path, or \"none\"",
+        "# volume: 0-100        sound_repeats: 1-10",
+        "# bigclock: auto shows the block clock, off never does",
+    ]
+    for key in ("sound", "sound_repeats", "volume", "notify", "bigclock"):
+        value = cfg[key]
+        if isinstance(value, bool):
+            rendered = "true" if value else "false"
+        elif isinstance(value, (int, float)):
+            rendered = str(value)
+        else:
+            rendered = json.dumps(str(value))
+        lines.append(f"{key} = {rendered}")
+    CONFIG_PATH.write_text("\n".join(lines) + "\n")
+
+
+def available_sounds() -> list[str]:
+    names: list[str] = []
+    for directory in SOUND_DIRS:
+        if not directory.is_dir():
+            continue
+        for path in sorted(directory.iterdir()):
+            if path.suffix in {".oga", ".ogg", ".wav"} and path.stem not in names:
+                names.append(path.stem)
+    return names
+
+
+def resolve_sound(value: str | None) -> Path | None:
+    """Turn a config value into a playable file, or None for silence."""
+    if not value:
+        return None
+    text = str(value).strip()
+    if text.lower() in {"none", "off", "silent", "no"}:
+        return None
+    path = Path(text).expanduser()
+    if path.is_file():
+        return path
+    for directory in SOUND_DIRS:
+        for suffix in (".oga", ".ogg", ".wav"):
+            candidate = directory / (text + suffix)
+            if candidate.is_file():
+                return candidate
+        candidate = directory / text
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def player_command(path: Path, volume: int) -> list[str] | None:
+    volume = max(0, min(150, int(volume)))
+    if shutil.which("paplay"):
+        cmd = ["paplay"]
+        if volume != 100:
+            cmd.append(f"--volume={int(volume * 655.36)}")
+        return cmd + [str(path)]
+    if shutil.which("pw-play"):
+        return ["pw-play", f"--volume={volume}", str(path)]
+    if shutil.which("canberra-gtk-play"):
+        return ["canberra-gtk-play", "-i", path.stem]
+    if shutil.which("ffplay"):
+        return ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet",
+                "-volume", str(volume), str(path)]
+    return None
+
+
+# ---------------------------------------------------------------- parsing
+
+STOPWORDS = {
+    "timer", "timers", "set", "start", "a", "an", "the", "me", "my", "to",
+    "for", "in", "at", "until", "till", "til", "from", "now", "and", "plus",
+    "of", "please", "on", "by", "s", "wake", "remind",
+}
+
+WORD_PHRASES = [
+    (r"half\s+an?\s+hour", "30 minutes"),
+    (r"half\s+hour", "30 minutes"),
+    (r"quarter\s+(?:of\s+)?an?\s+hour", "15 minutes"),
+    (r"quarter\s+hour", "15 minutes"),
+    (r"1\s+hour\s+and\s+a\s+half|hour\s+and\s+a\s+half", "90 minutes"),
+    (r"\ban?\s+hour", "1 hour"),
+    (r"\ban?\s+minute", "1 minute"),
+    (r"\ban?\s+second", "1 second"),
+    (r"\ban?\s+day", "1 day"),
+]
+
+ONES = {
+    "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
+    "seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11,
+    "twelve": 12, "thirteen": 13, "fourteen": 14, "fifteen": 15,
+    "sixteen": 16, "seventeen": 17, "eighteen": 18, "nineteen": 19,
+}
+TENS = {
+    "twenty": 20, "thirty": 30, "forty": 40, "fifty": 50,
+    "sixty": 60, "seventy": 70, "eighty": 80, "ninety": 90,
+}
+
+CLOCK_COLON = re.compile(r"\b(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(am|pm|a\.m\.|p\.m\.)?(?![\w:])")
+CLOCK_AMPM = re.compile(r"\b(\d{1,2})\s*(am|pm|a\.m\.|p\.m\.)(?!\w)")
+CLOCK_WORD = re.compile(r"\b(noon|midnight)\b")
+DURATION = re.compile(
+    r"(\d+(?:\.\d+)?)\s*"
+    r"(seconds?|secs?|s|minutes?|mins?|m|hours?|hrs?|h|days?|d)(?![a-zA-Z])"
+)
+BARE_NUMBER = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*$")
+
+UNIT_SECONDS = {
+    "s": 1, "sec": 1, "secs": 1, "second": 1, "seconds": 1,
+    "m": 60, "min": 60, "mins": 60, "minute": 60, "minutes": 60,
+    "h": 3600, "hr": 3600, "hrs": 3600, "hour": 3600, "hours": 3600,
+    "d": 86400, "day": 86400, "days": 86400,
+}
+
+SPOKEN_PAST = re.compile(r"\b(half|quarter)\s+(past|to)\s+([a-z]+)\b")
+SPOKEN_OCLOCK = re.compile(r"\b([a-z]+)\s*o'?\s?clock\b")
+SPOKEN_PAIR_AT = re.compile(r"\b(at|by|until|till|til)\s+([a-z]+)\s+([a-z]+)\b")
+SPOKEN_PAIR_MER = re.compile(r"\b([a-z]+)\s+([a-z]+)\s*(am|pm|a\.m\.|p\.m\.)")
+
+
+def words_to_digits(text: str) -> str:
+    toks = text.split()
+    out, i = [], 0
+    while i < len(toks):
+        tok = toks[i].strip(",.")
+        nxt = toks[i + 1].strip(",.") if i + 1 < len(toks) else None
+        if tok in TENS and nxt in ONES and ONES[nxt] < 10:
+            out.append(str(TENS[tok] + ONES[nxt]))
+            i += 2
+            continue
+        if tok in TENS:
+            out.append(str(TENS[tok]))
+        elif tok in ONES:
+            out.append(str(ONES[tok]))
+        else:
+            out.append(toks[i])
+        i += 1
+    return " ".join(out)
+
+
+def _word_num(word: str):
+    if word in ONES:
+        return ONES[word]
+    return TENS.get(word)
+
+
+def spoken_clock(text: str) -> str:
+    """Rewrite spoken clock forms into H:MM before digits are parsed."""
+
+    def _past(m):
+        qual, rel, word = m.group(1), m.group(2), m.group(3)
+        hour = _word_num(word)
+        if hour is None or hour > 12:
+            return m.group(0)
+        if rel == "past":
+            return f"{hour}:{'30' if qual == 'half' else '15'}"
+        hour -= 1
+        if hour == 0:
+            hour = 12
+        return f"{hour}:45"
+
+    def _oclock(m):
+        hour = _word_num(m.group(1))
+        if hour is None or hour > 12:
+            return m.group(0)
+        return f"{hour}:00"
+
+    def _pair_at(m):
+        hour, minute = _word_num(m.group(2)), _word_num(m.group(3))
+        if hour is None or minute is None or hour > 24 or not 0 <= minute <= 59:
+            return m.group(0)
+        return f"{m.group(1)} {hour}:{minute:02d}"
+
+    def _pair_mer(m):
+        hour, minute = _word_num(m.group(1)), _word_num(m.group(2))
+        if hour is None or minute is None or hour > 24 or not 0 <= minute <= 59:
+            return m.group(0)
+        return f"{hour}:{minute:02d} {m.group(3)}"
+
+    text = SPOKEN_PAST.sub(_past, text)
+    text = SPOKEN_OCLOCK.sub(_oclock, text)
+    text = SPOKEN_PAIR_AT.sub(_pair_at, text)
+    return SPOKEN_PAIR_MER.sub(_pair_mer, text)
+
+
+def _to24(hour: int, minute: int, meridiem: str | None) -> tuple[int, int]:
+    if not (0 <= minute <= 59):
+        raise ParseError(f"{minute} is not a valid minute")
+    if meridiem:
+        m = meridiem.replace(".", "")
+        if not (1 <= hour <= 12):
+            raise ParseError(f"{hour}:{minute:02d} {meridiem} is not a valid time")
+        if m == "pm" and hour < 12:
+            hour += 12
+        elif m == "am" and hour == 12:
+            hour = 0
+    if not (0 <= hour <= 23):
+        raise ParseError(f"{hour} is not a valid hour")
+    return hour, minute
+
+
+def parse(spec: str, now: datetime, day_hint: str | None = None) -> dict:
+    """Turn a natural language spec into {kind, label, target, seconds, ...}.
+
+    Raises ParseError rather than guessing when the text is not understood.
+    """
+    raw = " ".join(spec.lower().split())
+    if not raw:
+        raise ParseError("nothing to parse")
+
+    text = raw
+    text = re.sub(
+        r"\b(twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety)"
+        r"-(one|two|three|four|five|six|seven|eight|nine)\b",
+        r"\1 \2", text)
+    text = spoken_clock(text)
+    for pat, repl in WORD_PHRASES:
+        text = re.sub(pat, repl, text)
+    text = words_to_digits(text)
+    text = " ".join(text.split())
+
+    # a colon or an am/pm marker means a clock time, not a delay
+    m = CLOCK_COLON.search(text)
+    if m:
+        hour, minute = _to24(int(m.group(1)), int(m.group(2)), m.group(4))
+        return _clock_result(hour, minute, now, day_hint, m.group(0))
+
+    m = CLOCK_AMPM.search(text)
+    if m:
+        hour, minute = _to24(int(m.group(1)), 0, m.group(2))
+        return _clock_result(hour, minute, now, day_hint, m.group(0))
+
+    m = CLOCK_WORD.search(text)
+    if m:
+        hour, minute = (12, 0) if m.group(1) == "noon" else (0, 0)
+        return _clock_result(hour, minute, now, day_hint, m.group(0))
+
+    total, consumed = 0.0, []
+    for m in DURATION.finditer(text):
+        amount = float(m.group(1))
+        unit = m.group(2)
+        if unit not in UNIT_SECONDS:
+            raise ParseError(f"unknown unit {unit!r}")
+        total += amount * UNIT_SECONDS[unit]
+        consumed.append((m.start(), m.end()))
+
+    if consumed:
+        leftover = _leftover(text, consumed)
+        if leftover:
+            raise ParseError(f"not understood: {leftover!r}")
+    else:
+        m = BARE_NUMBER.match(text)
+        if not m:
+            leftover = _leftover(text, [])
+            raise ParseError(f"not understood: {leftover or spec.strip()!r}")
+        total = float(m.group(1)) * 60
+
+    if total <= 0:
+        raise ParseError("a timer has to be longer than zero")
+    if total > MAX_SECONDS:
+        raise ParseError("that is more than 30 days out")
+    seconds = int(round(total))
+    return {
+        "kind": "duration",
+        "label": None,
+        "target": now + timedelta(seconds=seconds),
+        "seconds": seconds,
+        "matched": spec.strip(),
+        "wrapped": False,
+    }
+
+
+def _leftover(text: str, spans: list[tuple[int, int]]) -> str:
+    keep, cursor = [], 0
+    for start, end in sorted(spans):
+        keep.append(text[cursor:start])
+        cursor = end
+    keep.append(text[cursor:])
+    words = [w for w in " ".join(keep).replace(",", " ").split() if w not in STOPWORDS]
+    return " ".join(words)
+
+
+def _clock_result(hour, minute, now, day_hint, matched) -> dict:
+    base = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if day_hint == "tomorrow":
+        base += timedelta(days=1)
+    elif day_hint == "today":
+        if base <= now:
+            raise ParseError(
+                f"{hour:02d}:{minute:02d} has already passed today; "
+                "drop --today to use the next occurrence"
+            )
+    elif base <= now:
+        base += timedelta(days=1)
+    seconds = int((base - now).total_seconds())
+    if seconds <= 0:
+        base += timedelta(days=1)
+        seconds = int((base - now).total_seconds())
+    return {
+        "kind": "clock",
+        "label": None,
+        "target": base,
+        "seconds": seconds,
+        "matched": matched.strip(),
+        "wrapped": base.date() != now.date(),
+    }
+
+
+# ---------------------------------------------------------------- formatting
+
+def fmt_delta(seconds: float) -> str:
+    seconds = int(round(seconds))
+    if seconds < 0:
+        seconds = 0
+    days, rem = divmod(seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, secs = divmod(rem, 60)
+    parts = []
+    if days:
+        parts.append(f"{days}d")
+    if hours:
+        parts.append(f"{hours}h")
+    if minutes:
+        parts.append(f"{minutes}m")
+    if secs and not days:
+        parts.append(f"{secs}s")
+    return " ".join(parts) or "0s"
+
+
+def fmt_when(dt: datetime, now: datetime) -> str:
+    if dt.date() == now.date():
+        day = "today "
+    elif dt.date() == (now + timedelta(days=1)).date():
+        day = "tomorrow "
+    else:
+        day = dt.strftime("%a %b %d ")
+    return f"{day}{dt.strftime('%-I:%M:%S %p')}".strip()
+
+
+def fmt_due(epoch: float) -> str:
+    return datetime.fromtimestamp(epoch).strftime("%a %b %d %-I:%M %p")
+
+
+# ---------------------------------------------------------------- state
+
+def ensure_state() -> None:
+    TIMERS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def timer_path(timer_id: str) -> Path:
+    return TIMERS_DIR / f"{timer_id}.json"
+
+
+def new_id() -> str:
+    for _ in range(20):
+        cand = uuid.uuid4().hex[:4]
+        if not timer_path(cand).exists():
+            return cand
+    raise RuntimeError("could not allocate a timer id")
+
+
+def pid_alive(pid: int | None) -> bool:
+    if not pid:
+        return False
+    try:
+        os.kill(pid, 0)
+    except (OSError, ValueError):
+        return False
+    return True
+
+
+def load_timers() -> list[dict]:
+    if not TIMERS_DIR.is_dir():
+        return []
+    out = []
+    for path in sorted(TIMERS_DIR.glob("*.json")):
+        try:
+            data = json.loads(path.read_text())
+        except (OSError, ValueError):
+            continue
+        data["_path"] = path
+        out.append(data)
+    out.sort(key=lambda d: d.get("target_epoch", 0))
+    return out
+
+
+def prune(now: float) -> list[dict]:
+    """Drop records whose process died or whose time already fired."""
+    live = []
+    for data in load_timers():
+        if data.get("target_epoch", 0) <= now - 2 or not pid_alive(data.get("pid")):
+            try:
+                data["_path"].unlink()
+            except OSError:
+                pass
+            continue
+        live.append(data)
+    return live
+
+
+# ---------------------------------------------------------------- alert
+
+def start_notification(title: str, body: str):
+    """Post the alarm notification and wait for it to be closed.
+
+    notify-send -w blocks until the notification is dismissed or expires, and
+    -p prints the id first, so the returned process is both the id source and
+    the signal that the person has seen it.
+    """
+    exe = shutil.which("notify-send")
+    if not exe:
+        return None
+    cmd = [exe, "-a", APP, "-u", "critical", "-t", "0", "-p", "-w", title, body]
+    try:
+        proc = subprocess.Popen(
+            cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, text=True,
+        )
+    except OSError:
+        return None
+    notification_id = ""
+    try:
+        ready, _, _ = select.select([proc.stdout], [], [], 2.0)
+        if ready:
+            notification_id = proc.stdout.readline().strip()
+    except (OSError, ValueError):
+        pass
+    proc.notification_id = notification_id  # type: ignore[attr-defined]
+    return proc
+
+
+def notification_closed(proc) -> bool:
+    """True once the notification has been dismissed or closed."""
+    return proc is not None and proc.poll() is not None
+
+
+def chime_until(sound: str | None, repeats: int, volume: int, should_stop=None) -> bool:
+    """Play the alarm, stopping the moment should_stop() turns true.
+
+    Returns True when it was cut short.
+    """
+    path = resolve_sound(sound)
+    if path is None:
+        return False
+    cmd = player_command(path, volume)
+    if cmd is None:
+        sys.stderr.write("\a")
+        return False
+    repeats = max(1, min(10, int(repeats)))
+    for i in range(repeats):
+        if should_stop and should_stop():
+            return True
+        try:
+            play = subprocess.Popen(
+                cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except OSError:
+            sys.stderr.write("\a")
+            return False
+        cut = False
+        while play.poll() is None:
+            if should_stop and should_stop():
+                cut = True
+                try:
+                    play.terminate()
+                except OSError:
+                    pass
+                break
+            time.sleep(0.05)
+        try:
+            play.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            play.kill()
+        if cut:
+            return True
+        if i < repeats - 1:
+            for _ in range(10):
+                if should_stop and should_stop():
+                    return True
+                time.sleep(0.1)
+    return False
+
+
+def log_fired(data: dict, notification_id: str = "") -> None:
+    try:
+        ensure_state()
+        with FIRED_LOG.open("a") as fh:
+            fh.write(
+                f"{datetime.now().isoformat(timespec='seconds')}\t"
+                f"{data.get('id')}\t{data.get('label') or ''}\t"
+                f"{data.get('requested') or ''}\t{notification_id}\n"
+            )
+    except OSError:
+        pass
+
+
+def fire(data: dict) -> None:
+    """One notification. Dismissing it silences the alarm."""
+    label = data.get("label")
+    title = f"Timer: {label}" if label else "Timer done"
+    spoken = data.get("requested") or fmt_delta(data.get("seconds", 0))
+    body = f"{spoken} is up."
+
+    watcher = None
+    if data.get("notify", True):
+        watcher = start_notification(title, body)
+    log_fired(data, getattr(watcher, "notification_id", "") if watcher else "")
+
+    chime_until(
+        data.get("sound"),
+        data.get("sound_repeats", 3),
+        data.get("volume", 100),
+        should_stop=(lambda: notification_closed(watcher)) if watcher else None,
+    )
+
+    # stop waiting on a notification nobody is going to dismiss; the
+    # notification itself stays on screen because it is not transient
+    if watcher is not None and watcher.poll() is None:
+        try:
+            watcher.terminate()
+        except OSError:
+            pass
+
+
+# ---------------------------------------------------------------- daemon
+
+def run_daemon(timer_id: str) -> int:
+    path = timer_path(timer_id)
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return 0
+    target = float(data["target_epoch"])
+    while True:
+        left = target - time.time()
+        if left <= 0:
+            break
+        if not path.exists():
+            return 0  # cancelled
+        time.sleep(min(left, 15))
+    if not path.exists():
+        return 0
+    try:
+        path.unlink()
+    except OSError:
+        return 0
+    fire(data)
+    return 0
+
+
+# ---------------------------------------------------------------- big clock
+
+FONT = {
+    "0": ["█████", "█   █", "█   █", "█   █", "█████"],
+    "1": ["  ██ ", "   █ ", "   █ ", "   █ ", "  ███"],
+    "2": ["█████", "    █", "█████", "█    ", "█████"],
+    "3": ["█████", "    █", "█████", "    █", "█████"],
+    "4": ["█   █", "█   █", "█████", "    █", "    █"],
+    "5": ["█████", "█    ", "█████", "    █", "█████"],
+    "6": ["█████", "█    ", "█████", "█   █", "█████"],
+    "7": ["█████", "    █", "    █", "    █", "    █"],
+    "8": ["█████", "█   █", "█████", "█   █", "█████"],
+    "9": ["█████", "█   █", "█████", "    █", "█████"],
+    ":": ["  ", "██", "  ", "██", "  "],
+    ".": ["  ", "  ", "  ", "  ", "██"],
+    " ": ["  ", "  ", "  ", "  ", "  "],
+}
+FONT_ROWS = 5
+GLYPH_GAP = " "
+
+C_RESET = "\x1b[0m"
+C_DIM = "\x1b[38;5;244m"
+C_GREEN = "\x1b[38;5;46m"
+C_YELLOW = "\x1b[38;5;226m"
+C_RED = "\x1b[38;5;196m"
+C_TRACK = "\x1b[38;5;238m"
+C_LABEL = "\x1b[38;5;111m"
+
+
+def big_art(text: str) -> list[str]:
+    rows = [""] * FONT_ROWS
+    for index, char in enumerate(text):
+        glyph = FONT.get(char, FONT[" "])
+        for row in range(FONT_ROWS):
+            rows[row] += glyph[row]
+            if index < len(text) - 1:
+                rows[row] += GLYPH_GAP
+    return rows
+
+
+def art_width(text: str) -> int:
+    return len(big_art(text)[0])
+
+
+def clock_text(remaining: float, force_hours: bool) -> str:
+    total = max(0, int(remaining + 0.999))
+    hours, rem = divmod(total, 3600)
+    minutes, seconds = divmod(rem, 60)
+    if hours or force_hours:
+        return f"{hours}:{minutes:02d}:{seconds:02d}"
+    return f"{minutes:02d}:{seconds:02d}"
+
+
+def pick_text(remaining: float, force_hours: bool, cols: int) -> str:
+    candidates = []
+    if force_hours:
+        candidates.append(clock_text(remaining, True))
+    candidates.append(clock_text(remaining, False))
+    for candidate in candidates:
+        if art_width(candidate) <= cols - 2:
+            return candidate
+    return candidates[-1]
+
+
+def center(text: str, width: int) -> str:
+    return " " * max(0, (width - len(text)) // 2) + text
+
+
+def build_frame(data: dict, now: float, cols: int, rows: int, blink: bool) -> list[str]:
+    target = float(data["target_epoch"])
+    created = float(data.get("created_epoch", target - data.get("seconds", 0)))
+    total = max(1.0, target - created)
+    remaining = target - now
+    force_hours = data.get("seconds", 0) >= 3600 or remaining >= 3600
+    text = pick_text(remaining, force_hours, cols)
+
+    if remaining <= 0:
+        colour, state = C_RED, "TIME UP"
+    elif remaining < 60:
+        colour, state = C_YELLOW, "almost up"
+    else:
+        colour, state = C_GREEN, ""
+
+    lines: list[str] = []
+    header = "  ".join(part for part in (state, data.get("label") or "") if part)
+    if header:
+        lines.append(C_LABEL + center(header[: max(1, cols - 2)], cols) + C_RESET)
+    else:
+        lines.append("")
+
+    if art_width(text) <= cols:
+        for row in big_art(text):
+            lines.append(" " * max(0, (cols - len(row)) // 2) + colour + row + C_RESET)
+    else:
+        lines.append(center(colour + text + C_RESET, cols))
+
+    lines.append("")
+    ends = datetime.fromtimestamp(target).strftime("%-I:%M %p")
+    lines.append(C_DIM + center(f"ends {ends}", cols) + C_RESET)
+
+    bar_width = max(10, min(46, cols - 12))
+    progress = 1.0 if remaining <= 0 else min(1.0, max(0.0, 1.0 - remaining / total))
+    filled = int(round(progress * bar_width))
+    bar = C_GREEN + "█" * filled + C_TRACK + "░" * (bar_width - filled) + C_RESET
+    lines.append(" " * max(0, (cols - bar_width) // 2) + bar)
+    lines.append("")
+    if remaining <= 0:
+        hint = "done" if blink else ""
+    elif data.get("_fg"):
+        hint = "ctrl-c stops the timer"
+    else:
+        hint = "q leaves this view   c cancels the timer"
+    lines.append(C_DIM + center(hint, cols) + C_RESET)
+    return lines
+
+
+def draw(lines: list[str], cols: int, rows: int) -> None:
+    top = max(0, (rows - len(lines)) // 2)
+    body = ([""] * top + lines)[:rows]
+    out = ["\x1b[H"]
+    for index in range(rows):
+        out.append((body[index] if index < len(body) else "") + "\x1b[K")
+        if index < rows - 1:
+            out.append("\r\n")
+    sys.stdout.write("".join(out))
+    sys.stdout.flush()
+
+
+def run_view(data: dict, foreground: bool) -> int:
+    """Draw the block clock until the target passes or the user quits."""
+    view = dict(data)
+    view["_fg"] = foreground
+    stdin_fd = sys.stdin.fileno()
+    old = termios.tcgetattr(stdin_fd)
+    cancel = False
+    try:
+        tty.setcbreak(stdin_fd)
+        sys.stdout.write("\x1b[?1049h\x1b[?25l\x1b[2J")
+        sys.stdout.flush()
+        while True:
+            now = time.time()
+            size = shutil.get_terminal_size((80, 24))
+            lines = build_frame(view, now, size.columns, size.lines, blink=int(now) % 2 == 0)
+            draw(lines, size.columns, size.lines)
+            if now >= float(view["target_epoch"]):
+                time.sleep(2.5)
+                break
+            wait = min(0.25, max(0.02, float(view["target_epoch"]) - now))
+            ready, _, _ = select.select([stdin_fd], [], [], wait)
+            if ready:
+                key = os.read(stdin_fd, 1)
+                if key in (b"q", b"Q", b"\x1b"):
+                    break
+                if key in (b"c", b"C"):
+                    cancel = True
+                    break
+    except KeyboardInterrupt:
+        cancel = foreground
+    finally:
+        sys.stdout.write("\x1b[0m\x1b[?25h\x1b[?1049l")
+        sys.stdout.flush()
+        termios.tcsetattr(stdin_fd, termios.TCSADRAIN, old)
+
+    if cancel:
+        kill_timer(view)
+        print(f"timer {view['id']} cancelled")
+        return 130
+    left = float(view["target_epoch"]) - time.time()
+    if left > 0:
+        print(f"timer {view['id']} still running: {fmt_delta(left)} left, "
+              f"due {fmt_due(view['target_epoch'])}")
+    else:
+        print(f"timer {view['id']} finished at {fmt_due(view['target_epoch'])}")
+    return 0
+
+
+# ---------------------------------------------------------------- commands
+
+def schedule(spec_words, label, options) -> tuple[int, dict | None]:
+    now = datetime.now()
+    spec = " ".join(spec_words)
+    try:
+        result = parse(spec, now, options["day_hint"])
+    except ParseError as exc:
+        sys.stderr.write(f"timer: {exc}\n")
+        sys.stderr.write("       try: timer 10m  |  timer set 12:15  |  timer --help\n")
+        return 2, None
+
+    target: datetime = result["target"]
+    seconds = result["seconds"]
+    when = fmt_when(target, now)
+    delta = fmt_delta(seconds)
+
+    if options["dry_run"]:
+        print(json.dumps({
+            "kind": result["kind"],
+            "label": label,
+            "matched": result["matched"],
+            "target_iso": target.isoformat(timespec="seconds"),
+            "target_epoch": int(target.timestamp()),
+            "delta_seconds": seconds,
+            "delta": delta,
+            "wrapped": result["wrapped"],
+            "when": when,
+        }))
+        return 0, None
+
+    if result["kind"] == "clock" and seconds > CLOCK_WARN_SECONDS:
+        sys.stderr.write(
+            f"timer: nearest {spec.strip()!r} is {delta} away ({when}).\n"
+            f"       that is the next occurrence; --today or --tomorrow to be explicit.\n"
+        )
+
+    cfg = options["config"]
+    ensure_state()
+    timer_id = new_id()
+    data = {
+        "id": timer_id,
+        "label": label,
+        "requested": spec.strip(),
+        "matched": result["matched"],
+        "kind": result["kind"],
+        "seconds": seconds,
+        "created_epoch": time.time(),
+        "target_epoch": target.timestamp(),
+        "target_iso": target.isoformat(timespec="seconds"),
+        "pid": None,
+        "sound": options["sound"] if options["sound"] is not None else cfg["sound"],
+        "sound_repeats":
+            options["repeats"] if options["repeats"] is not None else cfg["sound_repeats"],
+        "volume": options["volume"] if options["volume"] is not None else cfg["volume"],
+        "notify": cfg["notify"],
+    }
+    path = timer_path(timer_id)
+    path.write_text(json.dumps(data))
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, os.path.abspath(__file__), "--_run", timer_id],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            close_fds=True,
+        )
+    except OSError as exc:
+        path.unlink(missing_ok=True)
+        sys.stderr.write(f"timer: could not start the timer process: {exc}\n")
+        return 1, None
+    data["pid"] = proc.pid
+    path.write_text(json.dumps(data))
+    return 0, data
+
+
+def announce(data: dict) -> None:
+    name = f'"{data["label"]}" ' if data.get("label") else ""
+    print(f"{data['id']}  {name}{fmt_delta(data['seconds'])}  ->  "
+          f"{fmt_due(data['target_epoch'])}")
+
+
+def cmd_list(_args: list[str]) -> int:
+    now = time.time()
+    live = prune(now)
+    if not live:
+        print("no timers running")
+        return 0
+    print(f"{'ID':<6}{'REMAINING':<12}{'DUE':<24}LABEL")
+    for data in live:
+        print(f"{data['id']:<6}{fmt_delta(data['target_epoch'] - now):<12}"
+              f"{fmt_due(data['target_epoch']):<24}"
+              f"{data.get('label') or data.get('requested', '')}")
+    return 0
+
+
+def kill_timer(data: dict) -> None:
+    pid = data.get("pid")
+    if pid_alive(pid):
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+    path = data.get("_path") or timer_path(data.get("id", ""))
+    try:
+        Path(path).unlink()
+    except OSError:
+        pass
+
+
+def cmd_cancel(args: list[str]) -> int:
+    if not args:
+        sys.stderr.write("timer: cancel needs an id, or 'all' (see timer list)\n")
+        return 2
+    want = args[0].lower()
+    live = prune(time.time())
+    if want in {"all", "*"}:
+        if not live:
+            print("no timers to cancel")
+            return 0
+        for data in live:
+            kill_timer(data)
+        print(f"cancelled {len(live)} timer{'s' if len(live) != 1 else ''}")
+        return 0
+    matches = [d for d in live if d["id"] == want] or [d for d in live if d["id"].startswith(want)]
+    if not matches:
+        sys.stderr.write(f"timer: no timer matching {want!r}\n")
+        return 1
+    if len(matches) > 1:
+        sys.stderr.write("timer: "
+                         f"{want!r} is ambiguous: " + ", ".join(d["id"] for d in matches) + "\n")
+        return 1
+    kill_timer(matches[0])
+    print(f"cancelled {matches[0]['id']}")
+    return 0
+
+
+def cmd_watch(args: list[str]) -> int:
+    live = prune(time.time())
+    if not live:
+        sys.stderr.write("timer: nothing running to watch\n")
+        return 1
+    if not args:
+        return run_view(live[0], foreground=False)
+    want = args[0].lower()
+    matches = [d for d in live if d["id"] == want] or [d for d in live if d["id"].startswith(want)]
+    if not matches:
+        sys.stderr.write(f"timer: no timer matching {want!r}\n")
+        return 1
+    return run_view(matches[0], foreground=False)
+
+
+def cmd_config(args: list[str]) -> int:
+    cfg = load_config()
+    if not args:
+        suffix = "" if CONFIG_PATH.is_file() else "  (defaults, not written yet)"
+        print(f"config: {CONFIG_PATH}{suffix}")
+        for key in ("sound", "sound_repeats", "volume", "notify", "bigclock"):
+            print(f"  {key} = {json.dumps(cfg[key])}")
+        return 0
+    key = args[0]
+    if key not in DEFAULTS:
+        sys.stderr.write(f"timer: unknown setting {key!r}\n")
+        return 2
+    if len(args) == 1:
+        value = cfg[key]
+        print(value if isinstance(value, str) else json.dumps(value))
+        return 0
+    try:
+        cfg[key] = _coerce(key, " ".join(args[1:]))
+    except ValueError as exc:
+        sys.stderr.write(f"timer: {exc}\n")
+        return 2
+    save_config(cfg)
+    print(f"{key} = {json.dumps(cfg[key])}")
+    return 0
+
+
+def _coerce(key: str, value: str):
+    if key == "notify":
+        low = value.lower()
+        if low in {"true", "yes", "on", "1"}:
+            return True
+        if low in {"false", "no", "off", "0"}:
+            return False
+        raise ValueError("notify takes true or false")
+    if key == "sound_repeats":
+        try:
+            return max(1, min(10, int(value)))
+        except ValueError:
+            raise ValueError("sound_repeats takes a number") from None
+    if key == "volume":
+        try:
+            return max(0, min(150, int(value)))
+        except ValueError:
+            raise ValueError("volume takes a number from 0 to 100") from None
+    if key == "bigclock":
+        if value.lower() not in {"auto", "off"}:
+            raise ValueError("bigclock takes auto or off")
+        return value.lower()
+    if key == "sound":
+        if value.lower() in {"none", "off", "silent"}:
+            return "none"
+        if resolve_sound(value) is None:
+            raise ValueError(f"no such sound {value!r}; see `timer sounds`")
+        return value
+    return value
+
+
+def cmd_sound(args: list[str]) -> int:
+    cfg = load_config()
+    if not args:
+        print(cfg["sound"])
+        return 0
+    try:
+        cfg["sound"] = _coerce("sound", " ".join(args))
+    except ValueError as exc:
+        sys.stderr.write(f"timer: {exc}\n")
+        return 2
+    save_config(cfg)
+    print(f"sound = {cfg['sound']}")
+    return 0
+
+
+def cmd_sounds(_args: list[str]) -> int:
+    cfg = load_config()
+    names = available_sounds()
+    if not names:
+        print("no freedesktop sound files found")
+        return 1
+    print(f"current: {cfg['sound']}")
+    for name in names:
+        print(f"{'*' if name == cfg['sound'] else ' '} {name}")
+    return 0
+
+
+HELP = f"""nl-timer {VERSION}
+
+  timer 10m                    ten minutes, then the big clock
+  timer in 1 hour 30 minutes   durations, spelled or numeric
+  timer set 12:15              until 12:15, next occurrence
+  timer until 5pm              clock times, 24h or am/pm
+  timer half past five         spoken clock forms
+  timer noon                   noon or midnight
+  timer twenty five minutes    number words
+  timer 90                     a bare number is minutes
+  timer 10m -l tea             with a label
+  timer 10m -d                 schedule only, no clock view
+  timer 10m -n                 dry run: print the resolved target
+  timer watch                  big clock for the next timer
+  timer watch 3f2a             big clock for one timer
+  timer list                   running timers
+  timer cancel 3f2a            by id (prefix is enough)
+  timer clear                  cancel all
+  timer config                 show settings
+  timer config sound none      change one setting
+  timer sound alarm-clock-elapsed
+  timer sounds                 pick from installed sound files
+
+Flags: -l/--label  -d/--detach  -f/--foreground  -n/--dry-run  -s/--silent
+       --sound NAME  --repeat N  --volume N
+       --today  --tomorrow  -h/--help  -V/--version
+
+Settings: {CONFIG_PATH}
+One notification per timer, and it stays until dismissed. Dismissing it
+stops the alarm sound immediately; if nobody dismisses, the sound stops
+after its repeats and the notification stays on screen.
+Clock times use the next occurrence, so 12:15 at 1pm means tomorrow.
+Timers run detached and survive closing the terminal. In the clock view,
+q leaves without stopping the timer, c cancels it, ctrl-c with -f cancels it."""
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) >= 2 and argv[0] == "--_run":
+        return run_daemon(argv[1])
+    if argv and argv[0] in {"--_selftest", "--selftest"}:
+        return selftest()
+
+    args = list(argv)
+    if not args:
+        code = cmd_list([])
+        print()
+        print(HELP)
+        return code
+
+    head = args[0].lower()
+    subcommands = {
+        "list": cmd_list, "ls": cmd_list,
+        "cancel": cmd_cancel, "stop": cmd_cancel, "rm": cmd_cancel,
+        "clear": lambda a: cmd_cancel(["all"]),
+        "cancel-all": lambda a: cmd_cancel(["all"]),
+        "watch": cmd_watch, "view": cmd_watch, "attach": cmd_watch,
+        "config": cmd_config, "settings": cmd_config,
+        "sound": cmd_sound, "sounds": cmd_sounds,
+    }
+    if head in subcommands:
+        return subcommands[head](args[1:])
+    if head in {"-h", "--help", "help"}:
+        print(HELP)
+        return 0
+    if head in {"-V", "--version", "version"}:
+        print(f"nl-timer {VERSION}")
+        return 0
+
+    label = None
+    options = {
+        "dry_run": False, "detach": False, "foreground": False, "day_hint": None,
+        "sound": None, "repeats": None, "volume": None,
+        "config": load_config(),
+    }
+    words: list[str] = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in {"-l", "--label"}:
+            if i + 1 >= len(args):
+                sys.stderr.write("timer: --label needs a value\n")
+                return 2
+            label = args[i + 1]
+            i += 2
+            continue
+        if a.startswith("--label="):
+            label = a.split("=", 1)[1]
+            i += 1
+            continue
+        if a == "--sound" and i + 1 < len(args):
+            options["sound"] = args[i + 1]
+            i += 2
+            continue
+        if a.startswith("--sound="):
+            options["sound"] = a.split("=", 1)[1]
+            i += 1
+            continue
+        if a in {"--repeat", "--repeats"} and i + 1 < len(args):
+            try:
+                options["repeats"] = max(1, min(10, int(args[i + 1])))
+            except ValueError:
+                sys.stderr.write("timer: --repeat takes a number\n")
+                return 2
+            i += 2
+            continue
+        if a == "--volume" and i + 1 < len(args):
+            try:
+                options["volume"] = max(0, min(150, int(args[i + 1])))
+            except ValueError:
+                sys.stderr.write("timer: --volume takes a number\n")
+                return 2
+            i += 2
+            continue
+        if a in {"-d", "--detach", "--no-view", "--no-clock"}:
+            options["detach"] = True
+        elif a in {"-f", "--foreground"}:
+            options["foreground"] = True
+        elif a in {"-n", "--dry-run", "--parse-only"}:
+            options["dry_run"] = True
+        elif a in {"-s", "--silent", "-q", "--quiet"}:
+            options["sound"] = "none"
+        elif a == "--today":
+            options["day_hint"] = "today"
+        elif a == "--tomorrow":
+            options["day_hint"] = "tomorrow"
+        elif a in {"-h", "--help"}:
+            print(HELP)
+            return 0
+        elif a in {"-V", "--version"}:
+            print(f"nl-timer {VERSION}")
+            return 0
+        else:
+            words.append(a)
+        i += 1
+
+    code, data = schedule(words, label, options)
+    if data is None:
+        return code
+
+    announce(data)
+    wants_view = (
+        not options["detach"]
+        and options["config"]["bigclock"] != "off"
+        and sys.stdout.isatty()
+        and sys.stdin.isatty()
+    )
+    if wants_view:
+        return run_view(data, foreground=options["foreground"])
+    if options["foreground"]:
+        print("not a terminal here, so the timer is running in the background")
+    return 0
+
+
+# ---------------------------------------------------------------- tests
+
+def selftest() -> int:
+    now = datetime(2026, 10, 23, 11, 59, 0)
+    durations = {
+        "10m": 600, "10 min": 600, "in 10 minutes": 600, "for 10 minutes": 600,
+        "1h30m": 5400, "1 hour 30 minutes": 5400,
+        "1 hour and a half": 5400, "1 hour and half an hour": 5400,
+        "half an hour": 1800, "quarter of an hour": 900, "an hour": 3600,
+        "twenty five minutes": 1500, "twenty-five minutes": 1500,
+        "ten minutes": 600, "90": 5400, "30s": 30, "2 days": 172800,
+        "timer 45m": 2700, "set a timer for 3 minutes": 180,
+        "90 seconds": 90, "1.5 hours": 5400, "1 minute 30 seconds": 90,
+    }
+    clocks = {
+        "12:15": (12, 15), "set 12:15": (12, 15), "timer set 12:15": (12, 15),
+        "at 5pm": (17, 0), "5 pm": (17, 0), "until 17:30": (17, 30),
+        "noon": (12, 0), "midnight": (0, 0), "12am": (0, 0), "12pm": (12, 0),
+        "7:45 am": (7, 45), "23:59": (23, 59), "5p.m.": (17, 0),
+        "half past five": (5, 30), "quarter past six": (6, 15),
+        "quarter to six": (5, 45), "quarter to one": (12, 45),
+        "ten o'clock": (10, 0), "at twelve fifteen": (12, 15),
+        "twelve fifteen pm": (12, 15), "nine thirty am": (9, 30),
+    }
+    bad = ["banana", "0m", "10m foo", "25:00", "13pm", ""]
+
+    fails = []
+    for spec, want in durations.items():
+        try:
+            got = parse(spec, now)
+        except ParseError as exc:
+            fails.append(f"duration {spec!r}: raised {exc}")
+            continue
+        if got["kind"] != "duration":
+            fails.append(f"duration {spec!r}: kind {got['kind']}")
+        elif got["seconds"] != want:
+            fails.append(f"duration {spec!r}: {got['seconds']}s != {want}s")
+    for spec, (hour, minute) in clocks.items():
+        try:
+            got = parse(spec, now)
+        except ParseError as exc:
+            fails.append(f"clock {spec!r}: raised {exc}")
+            continue
+        target = got["target"]
+        if got["kind"] != "clock":
+            fails.append(f"clock {spec!r}: kind {got['kind']}")
+        elif (target.hour, target.minute) != (hour, minute):
+            fails.append(f"clock {spec!r}: {target.hour}:{target.minute:02d} "
+                         f"!= {hour}:{minute:02d}")
+        elif not 0 < got["seconds"] <= 86400:
+            fails.append(f"clock {spec!r}: delta {got['seconds']} out of range")
+    for spec in bad:
+        try:
+            parse(spec, now)
+            fails.append(f"bad {spec!r}: accepted, should have failed")
+        except ParseError:
+            pass
+
+    at_1201 = parse("12:15", datetime(2026, 10, 23, 12, 1, 0))
+    if at_1201["target"].day != 23:
+        fails.append("12:15 at 12:01 should stay today")
+    at_1220 = parse("12:15", datetime(2026, 10, 23, 12, 20, 0))
+    if at_1220["target"].day != 24:
+        fails.append("12:15 at 12:20 should roll to tomorrow")
+    try:
+        parse("12:15", datetime(2026, 10, 23, 13, 0, 0), "today")
+        fails.append("--today on a past time should raise")
+    except ParseError:
+        pass
+
+    # block clock rendering
+    for text in ("00:00", "10:00", "1:59:59", "TIME"):
+        art = big_art(text)
+        if len(art) != FONT_ROWS:
+            fails.append(f"art {text!r}: {len(art)} rows")
+        if len({len(row) for row in art}) != 1:
+            fails.append(f"art {text!r}: ragged rows {[len(r) for r in art]}")
+    if art_width("1:59:59") != 35:
+        fails.append(f"art width 1:59:59 = {art_width('1:59:59')}, expected 35")
+    if clock_text(59.4, False) != "01:00":
+        fails.append(f"rounding: {clock_text(59.4, False)}")
+    if clock_text(3661, True) != "1:01:01":
+        fails.append(f"hours form: {clock_text(3661, True)}")
+    if clock_text(59, True) != "0:00:59":
+        fails.append(f"forced hours form: {clock_text(59, True)}")
+
+    # a whole frame at 80 and 40 columns must fit and stay 5 rows tall
+    sample = {"id": "t", "label": "tea", "seconds": 600, "created_epoch": 1000.0,
+              "target_epoch": 1600.0}
+    strip = lambda line: re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", line).strip()
+    for cols in (80, 40, 30):
+        frame = build_frame(sample, 1300.0, cols, 24, blink=False)
+        want = [row.strip() for row in big_art(pick_text(300.0, False, cols))]
+        present = [strip(line) for line in frame]
+        missing = [row for row in want if row not in present]
+        if missing:
+            fails.append(f"frame at {cols} cols missing art rows {missing}")
+        if not any("ends" in line for line in present):
+            fails.append(f"frame at {cols} cols has no end time")
+    frame = build_frame({**sample, "target_epoch": 1000.0}, 1300.0, 80, 24, blink=True)
+    if not any("TIME UP" in line for line in frame):
+        fails.append("frame after the target should say TIME UP")
+
+    # config round trip on a scratch path
+    global CONFIG_PATH
+    saved = CONFIG_PATH
+    scratch = Path(os.environ.get("TMPDIR") or "/tmp") / f"nl-timer-selftest-{os.getpid()}.toml"
+    try:
+        CONFIG_PATH = scratch
+        save_config(dict(DEFAULTS))
+        if load_config()["sound_repeats"] != 3:
+            fails.append("config round trip lost sound_repeats")
+        save_config({**DEFAULTS, "sound": "none", "volume": 40, "notify": False})
+        reloaded = load_config()
+        if reloaded["sound"] != "none" or reloaded["volume"] != 40 or reloaded["notify"] is not False:
+            fails.append(f"config round trip: {reloaded}")
+        CONFIG_PATH.write_text("sound = 5\nbigclock = 'nonsense'\n")
+        if load_config()["sound"] != DEFAULTS["sound"]:
+            fails.append("bad config type should fall back to the default")
+    finally:
+        CONFIG_PATH = saved
+        try:
+            scratch.unlink()
+        except OSError:
+            pass
+
+    if resolve_sound("none") is not None:
+        fails.append("resolve_sound('none') should be None")
+    if resolve_sound("/nope/nothing.oga") is not None:
+        fails.append("resolve_sound on a missing path should be None")
+    names = available_sounds()
+    if names:
+        found = resolve_sound(names[0])
+        if found is None or not found.is_file():
+            fails.append("resolve_sound on a real sound name failed")
+    else:
+        fails.append("no sound files found on this machine")
+    if player_command(Path("/tmp/x.oga"), 50) is None:
+        fails.append("no audio player available")
+
+    total = len(durations) + len(clocks) + len(bad) + 18
+    if fails:
+        for failure in fails:
+            print("FAIL " + failure)
+        print(f"{len(fails)} of {total} failed")
+        return 1
+    print(f"ok: {total} cases pass")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
